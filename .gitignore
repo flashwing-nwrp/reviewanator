@@ -1,0 +1,12 @@
+# Generated per-project by /review-setup (not part of the plugin)
+# These files are project-specific and should NOT be committed to the plugin repo.
+# They SHOULD be committed to individual project repos.
+
+# Calibration state (tracks accuracy per category)
+# confidence.json  -- not in this repo, lives in .claude/review/
+
+# Review history logs
+# history/         -- not in this repo, lives in .claude/review/history/
+
+# Project-specific convention checklist (generated from CLAUDE.md)
+# _custom.md       -- not in this repo, lives in .claude/skills/review/checklists/

@@ -12,15 +12,27 @@ The system starts cautious and learns over time. Approve accurate findings, reje
 
 ## Install
 
-```bash
+**Step 1:** Register the marketplace (once per machine):
+
+```
+/plugin marketplace add flashwing-nwrp/reviewanator
+```
+
+**Step 2:** Install the plugin:
+
+```
 /plugin install reviewanator@flashwing-nwrp
 ```
 
-Then bootstrap your project:
+**Step 3:** Bootstrap your project (generates checklists, hooks, and calibration config):
 
 ```
 /review-setup
 ```
+
+> `/review-setup` scans your project, detects languages/frameworks, extracts conventions
+> from your `CLAUDE.md`, and generates tailored review infrastructure. Re-run with
+> `--update` when your project adds new languages or your conventions change.
 
 ## Quick Start
 
