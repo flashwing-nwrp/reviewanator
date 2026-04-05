@@ -1,19 +1,19 @@
 {
   "name": "reviewanator",
-  "version": "1.0.0",
   "description": "Automated code review with isolated reviewer + adversarial verifier, language-specific checklists, confidence calibration, and token budget controls",
-  "author": "Flashwing <https://github.com/flashwing-nwrp>",
-  "homepage": "https://github.com/flashwing-nwrp/reviewanator",
-  "repository": {
-    "type": "git",
-    "url": "https://github.com/flashwing-nwrp/reviewanator"
+  "version": "1.0.0",
+  "author": {
+    "name": "Flashwing",
+    "url": "https://github.com/flashwing-nwrp"
   },
+  "homepage": "https://github.com/flashwing-nwrp/reviewanator",
+  "repository": "https://github.com/flashwing-nwrp/reviewanator",
   "license": "MIT",
   "keywords": [
-    "claude-code",
     "code-review",
     "adversarial-verification",
     "calibration",
+    "checklists",
     "skills"
   ]
 }
