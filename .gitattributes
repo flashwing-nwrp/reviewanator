@@ -1,0 +1,5 @@
+# Normalize all text files to LF
+* text=auto eol=lf
+
+# Shell scripts must be LF (bash won't execute CRLF)
+*.sh text eol=lf
