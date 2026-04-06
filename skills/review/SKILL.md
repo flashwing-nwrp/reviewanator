@@ -359,8 +359,9 @@ Choose [1-N]:
 
 ### Mid-Review Controls
 
-After the reviewer subagent returns (Step 7):
-1. **Timeout:** If the reviewer takes longer than 120 seconds, stop and report:
+**After the reviewer subagent returns (Step 7):**
+
+1. **Reviewer timeout:** If the reviewer takes longer than 120 seconds, stop and report:
 ```
 The reviewer took too long (>120s). This usually means the diff is very large.
 
@@ -370,9 +371,17 @@ Try:
   /review --set-ceiling per_review=20000  (if budget allows more)
 ```
 
-2. **Finding cap:** After parsing the reviewer's JSON, if `findings.length > 25`:
+2. **Reviewer finding cap:** After parsing the reviewer's JSON, if `findings.length > 25`:
 - Truncate to top 25 by severity (all Critical, then Important, then Minor)
 - Report: "⚠ Review capped at 25 findings ([total] total). [omitted] Minor findings omitted."
+
+**After the verifier subagent returns (Step 7b):**
+
+3. **Verifier timeout:** If the verifier takes longer than 120 seconds, follow the timeout handling in Step 7b (set `verification_status = "failed"`, report options to user).
+
+4. **Verifier new-finding cap:** After parsing the verifier's JSON, if `new_findings.length > 10`:
+- Truncate to top 10 by severity (all Critical, then Important, then Minor)
+- Report: "⚠ Verifier new findings capped at 10 ([total] total). [omitted] lower-severity findings omitted."
 
 ---
 
@@ -401,19 +410,54 @@ Launch an isolated reviewer subagent using the Agent tool:
 
 Parse the JSON response. If parsing fails (the agent returned prose instead of JSON), ask the agent to retry with JSON-only output.
 
-## Step 7b: Dispatch Verifier Agent (Adversarial Verification)
+## Step 7b: Dispatch Verifier Agent (Adversarial Verification) — MANDATORY
 
-After the reviewer returns findings, dispatch the verifier — a second isolated agent with an adversarial bias. The verifier assumes every finding is wrong until independently proven.
+After the reviewer returns its output, **always** dispatch the verifier — a second isolated agent with an adversarial bias. The verifier assumes every finding is wrong until independently proven.
 
-**Always runs.** The verifier is not optional. Every finding must survive adversarial scrutiny before the human sees it.
+**This step is mandatory and cannot be skipped, bypassed, or deferred.** The verifier runs in ALL of these cases:
+- The reviewer found Critical/Important/Minor findings → verifier challenges them
+- The reviewer returned zero findings / a `pass` verdict → verifier independently audits the diff (pass verdicts are the most suspicious — see verifier template)
+- The reviewer returned only Minor findings → verifier still runs (minor issues may mask missed critical ones)
+
+No escape hatch, configuration flag, or token pressure removes this requirement. If you cannot run the verifier, you cannot present results — see the verification gate in Step 8.
+
+Set `verification_status = "pending"` before dispatch.
 
 1. Read the verifier template from `.claude/skills/review/verifier-agent.md`
 2. Replace placeholders:
    - `{CHANGE_CONTEXT}` — same Change Context from Step 2
    - `{DIFF}` — same diff from Step 1
-   - `{REVIEWER_FINDINGS}` — the full JSON output from the reviewer (Step 7)
+   - `{REVIEWER_FINDINGS}` — the full JSON output from the reviewer (Step 7), including `pass` verdicts with empty findings arrays
 3. Dispatch as an isolated subagent (no access to reviewer's context or this conversation)
 4. Parse the verifier's JSON response
+
+**Error handling (verifier dispatch):**
+
+- **JSON parse failure:** If the verifier returns prose instead of JSON, retry ONCE with explicit instruction: "Return ONLY the JSON output format specified in your instructions. No prose, no explanation." If the retry also fails, set `verification_status = "failed"` — do NOT proceed to Step 8.
+- **Agent dispatch failure:** If the Agent tool call itself errors (tool execution failure, network error, etc.), retry ONCE. If the retry fails, set `verification_status = "failed"` — do NOT proceed to Step 8.
+- **Timeout:** If the verifier takes longer than 120 seconds, set `verification_status = "failed"` and report:
+```
+The verifier took too long (>120s). This usually means the diff is very large.
+
+Try:
+  /review --staged          (review less code at once)
+  /review --branch          (let the system chunk it into batches)
+```
+- **On any failure**, report to the user:
+```
+⛔ Verification failed — cannot present unverified findings.
+
+The reviewer found [N] findings, but the verifier could not complete.
+Unverified findings are NEVER shown — this is a hard requirement.
+
+Options:
+  1. Retry verification (dispatch verifier again)
+  2. Retry full review (re-run from Step 7)
+  3. Abort this review
+```
+Wait for the user's choice before proceeding.
+
+**On success**, set `verification_status = "complete"`.
 
 **Process the verifier's output:**
 
@@ -433,6 +477,14 @@ For fix test challenges: Store for use in Step 9b (Fix Pipeline) — challenges 
 - If all Criticals were dismissed, verdict may change from `fail` to `pass_with_fixes`
 
 ## Step 8: Present Findings
+
+**Verification gate — HARD REQUIREMENT:**
+Before presenting ANY findings, confirm that `verification_status == "complete"`. If it is not:
+- `"pending"` → Step 7b was skipped. This is a bug in the orchestrator. Do NOT present findings. Go back and execute Step 7b.
+- `"failed"` → The verifier failed and the user was already prompted in Step 7b. Do NOT present findings until the user's chosen recovery path completes.
+- Missing/unset → Step 7b was never attempted. This is a bug. Do NOT present findings. Go back and execute Step 7b.
+
+**You must NEVER present reviewer findings that have not been through adversarial verification.** There are no exceptions to this rule. Unverified findings are untrustworthy and showing them to the user undermines the entire review system's credibility.
 
 Present the VERIFIED findings to the user. Only show findings that survived the verifier (Step 7b). Dismissed findings are excluded.
 
