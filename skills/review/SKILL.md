@@ -20,6 +20,7 @@ Parse the user's invocation to determine the review mode:
 | `--branch` | Branch diff | `git diff $(git merge-base HEAD main)..HEAD` |
 | `--pr [number]` | Pull request | `gh pr diff <number>` (or current PR if no number) |
 | `--full` | Full suite | Same as mode above, but skip confidence filtering in Step 4 |
+| `--with specialist[,specialist]` | Specialist override | Same diff mode, but force specific specialists in Step 7b |
 | `--calibrate` | Dashboard | Skip to Step 10 (show calibration dashboard) |
 | `--budget` | Spend report | Skip to Step 11 (show spend) |
 | `--skip "reason"` | Skip review | Log skip to escape_hatch_log in confidence.json, print confirmation, done |
@@ -401,77 +402,169 @@ Launch an isolated reviewer subagent using the Agent tool:
 
 Parse the JSON response. If parsing fails (the agent returned prose instead of JSON), ask the agent to retry with JSON-only output.
 
-## Step 7b: Dispatch Verifier Agent (Adversarial Verification)
+## Step 7b: Classify and Select Specialists
 
-After the reviewer returns findings, dispatch the verifier — a second isolated agent with an adversarial bias. The verifier assumes every finding is wrong until independently proven.
+After the reviewer returns findings, determine which specialist verifier(s) to dispatch.
 
-**Always runs.** The verifier is not optional. Every finding must survive adversarial scrutiny before the human sees it.
+**If `--full` flag:** Skip classification. Dispatch all 4 specialists (security, architecture, correctness, performance).
+**If `--with specialist1,specialist2` flag:** Skip classification. Dispatch the named specialists.
+**Otherwise:** Run the semantic classifier.
 
-1. Read the verifier template from `.claude/skills/review/verifier-agent.md`
-2. Replace placeholders:
+### Semantic Classifier
+
+Using the Change Context summary from Step 2, reason about which 1-2 specialists would provide the most valuable scrutiny for THIS specific change. Consider:
+
+- **SECURITY:** Does the change cross trust boundaries? Handle auth, input, events, secrets?
+- **ARCHITECTURE:** Does the change add/modify interfaces, create new modules, refactor structure?
+- **CORRECTNESS:** Does the change have complex conditionals, async patterns, state transitions, math?
+- **PERFORMANCE:** Does the change involve queries, loops, entity iteration, caching, tick-rate code?
+
+**Rules:**
+- Always select at least 1 specialist
+- Select 2 only when the change genuinely spans both domains
+- If the change is narrow and simple, 1 is better than 2
+- Never select more than 2 (hard cap)
+- Order by priority (most valuable first)
+
+State your selection and reasoning:
+```
+Specialists selected: [Security Adversary, Correctness Analyst]
+Reasoning: [RegisterNetEvent handlers cross trust boundary (Security), pcall/async patterns need edge-case analysis (Correctness)]
+```
+
+### Fallback: Grep Signal Detection
+
+If you cannot determine which specialists to dispatch from the Change Context (e.g., the context is too vague), fall back to counting grep signals in the diff:
+
+| Signal Pattern in Diff | Specialist |
+|----------------------|------------|
+| `RegisterNetEvent`, `TriggerServerEvent`, `source`, `password`, `secret`, `Bearer`, `auth`, `token`, `session` | Security |
+| `req.body`, `req.params`, SQL concatenation, `string.format` | Security |
+| New files, renames, >50% of file changed (from git diff --stat) | Architecture |
+| `exports`, `return {`, new function signatures, `RegisterCommand` | Architecture |
+| Nested `if/elseif`, ternary chains, `math.*`, comparison operators near boundaries | Correctness |
+| `CreateThread`, `Citizen.Wait`, `async`, `await`, `pcall`, `MySQL.*await` | Correctness |
+| `MySQL.query`, `MySQL.insert`, `SELECT`, `INSERT`, `GetGamePool` | Performance |
+| `while true`, `Wait(0)`, `Wait(1)`, `SetInterval`, `@Scheduled` | Performance |
+
+Score each specialist by signal count. Dispatch top scorer. Dispatch second only if 2+ signals. Tie-break: Security > Correctness > Architecture > Performance.
+
+If grep also finds nothing: dispatch Security + Correctness as safe defaults.
+
+Log the routing decision for the history entry (Step 9a).
+
+## Step 7c: Dispatch Specialist Verifier(s)
+
+For each selected specialist, dispatch an isolated subagent using the Agent tool.
+
+1. Check if the specialist file exists at `.claude/skills/review/specialists/{name}.md`:
+   - `security` → `security-adversary.md`
+   - `architecture` → `architecture-critic.md`
+   - `correctness` → `correctness-analyst.md`
+   - `performance` → `performance-sentinel.md`
+
+2. **Graceful fallback:** If the specialist file does NOT exist (e.g., old installation without specialists), fall back to the generalist verifier at `.claude/skills/review/verifier-agent.md`. Log: "Specialist [name] not found, using generalist verifier."
+
+3. Read the specialist's template and replace placeholders:
    - `{CHANGE_CONTEXT}` — same Change Context from Step 2
    - `{DIFF}` — same diff from Step 1
    - `{REVIEWER_FINDINGS}` — the full JSON output from the reviewer (Step 7)
-3. Dispatch as an isolated subagent (no access to reviewer's context or this conversation)
-4. Parse the verifier's JSON response
+   - `{LEARNED_RULES}` — only learned rules where the rule's `specialist` field matches this specialist. If no specialist-specific rules exist, use: "No learned rules apply."
 
-**Process the verifier's output:**
+4. **Parallel dispatch:** If 2 specialists are selected, launch BOTH Agent tool calls in the same message (parallel execution). Each specialist gets its own isolated subagent with no access to the other specialist's context or this conversation.
 
-For each verified finding:
-- **Confirmed:** Keep the finding, add verification note with evidence
-- **Challenged:** Keep the finding but flag as challenged with the verifier's counter-evidence. The human will decide.
-- **Unsubstantiated:** Keep the finding but flag as unverified. The human will decide.
-- **Upgraded:** Update the finding's severity with the verifier's evidence
-- **Dismissed:** Remove the finding from what the human sees. Log it in history as dismissed-by-verifier.
+5. Parse each specialist's JSON response. If parsing fails, ask the specialist to retry with JSON-only output.
 
-For new findings from the verifier: Add them to the findings list with `source: "verifier"`.
+## Step 7d: Merge Specialist Outputs
 
-For fix test challenges: Store for use in Step 9b (Fix Pipeline) — challenges must be addressed before fix tests are considered passing.
+### Single Specialist Path
 
-**Update the verdict** if the verifier changed findings:
-- Recalculate based on the verified finding set (not the original)
-- If all Criticals were dismissed, verdict may change from `fail` to `pass_with_fixes`
+If only 1 specialist was dispatched, no merge is needed. Use that specialist's output directly. Add `specialist_source` to each finding for presentation attribution. Proceed to Step 8.
+
+### Two-Specialist Merge
+
+When 2 specialists both evaluate the same reviewer finding (matched by `original_finding_index`):
+
+| Specialist A | Specialist B | Merged Status |
+|-------------|-------------|---------------|
+| Confirmed | Confirmed | **Confirmed** (note: both specialists agreed) |
+| Confirmed | Challenged | **Contested** (present both evidence trails) |
+| Confirmed | Dismissed | **Contested** (present both evidence trails) |
+| Challenged | Challenged | **Challenged** (present both counter-arguments) |
+| Challenged | Dismissed | **Dismissed** (neither confirmed) |
+| Dismissed | Dismissed | **Dismissed** |
+| Upgraded (either) | Any non-Dismissed | Use higher severity with upgrade evidence |
+| Upgraded (either) | Dismissed | **Contested** (one sees it worse, other sees nothing) |
+
+**Contested** is a new status. It means two specialists disagree. Do NOT resolve the disagreement — present both evidence trails to the human. The disagreement IS the value.
+
+### New Findings Dedup
+
+For new findings from both specialists:
+- If both flag the same file and overlapping line range (line–line_end overlap) with similar titles: merge into one finding, note both specialist sources
+- If they flag different aspects of the same code (different titles, different concerns): keep both as separate findings with their respective specialist attribution
+
+### Findings from Only One Specialist
+
+If a reviewer finding was only evaluated by one specialist (the other didn't address it): use that specialist's classification directly. This is normal — a Performance specialist may skip findings about auth patterns.
+
+For findings the reviewer raised but NEITHER specialist addressed: keep the finding as **Unverified** with note "No specialist evaluated this finding."
+
+### Verdict Recalculation
+
+After merge, recalculate the verdict based on the merged finding set:
+- Any Confirmed or Contested Critical → `fail`
+- Any Confirmed or Contested Important → `pass_with_fixes`
+- Only Minor, Challenged, or all Dismissed → `pass`
+
+Contested findings are treated as their original severity for verdict purposes — they haven't been confirmed safe.
 
 ## Step 8: Present Findings
 
-Present the VERIFIED findings to the user. Only show findings that survived the verifier (Step 7b). Dismissed findings are excluded.
+Present the MERGED findings to the user. Only show findings that survived specialist verification (Step 7d). Dismissed findings are excluded.
 
 **If this is the user's first review** (check `onboarding_flags.first_finding_explained` in confidence.json):
-- Add a brief explanation of severity levels, verification status, and how to respond
+- Add a brief explanation of severity levels, specialist verification, Contested status, and how to respond
 - Set `first_finding_explained: true` in confidence.json
 
 **Format findings as:**
 
 ```
-## Review Results — [verdict] (verified by adversarial agent)
+## Review Results — [verdict]
 
-[verdict_reasoning]
+Specialists dispatched: [Security Adversary, Correctness Analyst]
+Routing: [Semantic classifier — reasoning summary] | [Grep fallback — signals] | [User override via --with]
 
-Verification summary: [N] confirmed, [N] challenged, [N] unsubstantiated, [N] dismissed, [N] new from verifier
+Verification summary: [N] confirmed, [N] contested, [N] challenged, [N] dismissed, [N] new from specialists
 
 ### Critical
 [numbered findings with file:line, title, explanation, suggestion]
-Each finding includes verification status:
-  [CONFIRMED ✓ high confidence] — verifier independently traced and confirmed
-  [CHALLENGED ⚠ medium confidence] — verifier found counter-evidence (details shown)
-  [UNVERIFIED ?] — verifier could not confirm or deny (needs human judgment)
-  [UPGRADED ↑] — verifier found higher severity than reviewer claimed
-  [NEW — from verifier] — verifier found this, reviewer missed it
+Each finding includes verification status and specialist attribution:
+  [CONFIRMED ✓ Security Adversary, high confidence] — specialist traced and confirmed
+  [CONFIRMED ✓ Both specialists agreed, high confidence] — both independently confirmed
+  [CONTESTED ⚡] — specialists disagree:
+    Security Adversary: dismissed — "[evidence summary]"
+    Correctness Analyst: confirmed — "[evidence summary]"
+    → Your call.
+  [CHALLENGED ⚠ Architecture Critic, medium confidence] — specialist found counter-evidence
+  [UNVERIFIED ?] — no specialist evaluated this finding
+  [UPGRADED ↑ Performance Sentinel] — specialist found higher severity
+  [NEW — from Correctness Analyst] — specialist found this, reviewer missed it
 
-### Important  
-[numbered findings with verification status]
+### Important
+[numbered findings with specialist attribution]
 
 ### Minor
-[numbered findings with verification status]
+[numbered findings with specialist attribution]
 
-### Dismissed by Verifier (not shown to human unless requested)
+### Dismissed by Specialists (not shown unless requested)
 [count] findings dismissed — run /review --show-dismissed to see them
 
 ### Auto-Approved (skipped)
-[list of categories that were skipped due to high confidence, with confidence %]
+[list of checklist categories skipped due to high confidence, with confidence %]
 ```
 
-If no findings survive verification: "Clean review — no issues found (reviewer raised [N] findings, all dismissed by verifier). Verdict: pass"
+If no findings survive verification: "Clean review — no issues found. Specialists dispatched: [list]. Verdict: pass"
 
 **After findings, prompt for feedback:**
 ```
