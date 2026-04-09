@@ -645,6 +645,50 @@ Updated N findings:
 Current confidence: [average across active categories]%
 ```
 
+
+### Specialist Calibration
+
+In addition to category calibration (above), update specialist accuracy tracking:
+
+For each finding that has a `specialist_source`:
+
+**If approved:**
+1. Find the specialist in `confidence.json -> specialists -> {name}`
+2. Increment `findings_confirmed_accurate` by 1
+3. If the finding was `source: "new"` (specialist-generated, not reviewer), increment `new_findings_accepted` by 1
+4. If the finding was Contested and this specialist's verdict was the one the human agreed with, increment `contested_won` by 1
+5. Recalculate `accuracy = findings_confirmed_accurate / (findings_confirmed_accurate + findings_rejected)`
+
+**If rejected:**
+1. Find the specialist in `confidence.json -> specialists -> {name}`
+2. Increment `findings_rejected` by 1
+3. If the finding was `source: "new"`, increment `new_findings_rejected` by 1
+4. If the finding was Contested and this specialist's verdict was the one the human rejected, increment `contested_lost` by 1
+5. Recalculate accuracy
+
+**If rejected with reason:**
+1. Same as rejected above, PLUS:
+2. When creating the learned rule, add a `specialist` field set to the specialist's name
+3. This rule will only be included in that specialist's `{LEARNED_RULES}` on future reviews
+
+**If skipped:** No specialist calibration changes.
+
+### Classifier Feedback
+
+If the user used `--with` to override the classifier's selection for this review:
+1. Increment `classifier.overridden_by_user` by 1
+2. Add an entry to `classifier.override_log`:
+   ```json
+   {
+     "date": "YYYY-MM-DD",
+     "classifier_chose": ["architecture"],
+     "user_added": ["security"],
+     "user_removed": []
+   }
+   ```
+3. After 5+ overrides adding the same specialist, surface during Step 8:
+   "You frequently add [Specialist] manually. Consider `/review --full` for this area."
+
 ## Step 9a: Write History Log
 
 After processing feedback (or after the reviewer+verifier return findings if no feedback yet), write a review log entry.
@@ -660,6 +704,9 @@ Create a file at `.claude/review/history/{date}-{short-hash}.json` where `{date}
   "languages": ["java-spring"],
   "checklist_sections_included": 8,
   "checklist_sections_skipped": 5,
+  "specialists_dispatched": ["security", "correctness"],
+  "classifier_method": "semantic|grep-fallback|user-override|full",
+  "classifier_reasoning": "RegisterNetEvent handlers + pcall patterns",
   "findings": {
     "critical": 0,
     "important": 1,
@@ -668,11 +715,12 @@ Create a file at `.claude/review/history/{date}-{short-hash}.json` where `{date}
   },
   "verification": {
     "confirmed": 2,
+    "contested": 0,
     "challenged": 1,
     "unsubstantiated": 0,
     "upgraded": 0,
     "dismissed": 0,
-    "new_from_verifier": 0
+    "new_from_specialists": 0
   },
   "verdict": "pass_with_fixes",
   "feedback": {
@@ -896,6 +944,30 @@ Actionable Suggestions:
   [if recal approaching:] "Full recalibration in [N] reviews. Run /review --full to trigger now."
   [if active checkpoint:] "⚠ Unresolved fix checkpoint from [date]. Accept or rollback?"
 ```
+
+
+### Specialist Performance
+
+When `--calibrate` is invoked, also display specialist stats:
+
+```
+## Specialist Performance
+
+| Specialist    | Dispatched | Accuracy | Contested W/L | New Found | Learned Rules |
+|--------------|-----------|----------|---------------|-----------|---------------|
+| Security      | [n]       | [n%]     | [w]/[l]       | [a]/[r]   | [n]           |
+| Architecture  | [n]       | [n%]     | [w]/[l]       | [a]/[r]   | [n]           |
+| Correctness   | [n]       | [n%]     | [w]/[l]       | [a]/[r]   | [n]           |
+| Performance   | [n]       | [n%]     | [w]/[l]       | [a]/[r]   | [n]           |
+
+Classifier: [n] routes, [n] user overrides, [n] grep fallbacks
+```
+
+Where:
+- Accuracy = `findings_confirmed_accurate / (findings_confirmed_accurate + findings_rejected)` (or "N/A" if 0 dispatches)
+- Contested W/L = `contested_won` / `contested_lost`
+- New Found = `new_findings_accepted` / `new_findings_rejected`
+- Learned Rules = count of learned_rules where `specialist == name`
 
 ## Step 11: Budget Report (--budget)
 
