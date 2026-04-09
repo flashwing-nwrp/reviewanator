@@ -231,6 +231,34 @@ If NO confidence.json exists:
 - Set `review_hooks.precommit_mode` and `review_hooks.pr_mode` from Q5 answer
 - Set `token_ceiling` from Q6 answer (or defaults)
 - All categories empty — they populate dynamically during reviews
+- Initialize `specialists` with zeroed calibration for all four specialist types:
+  ```json
+  "specialists": {
+    "security": {
+      "dispatched": 0,
+      "findings_confirmed_accurate": 0,
+      "findings_rejected": 0,
+      "new_findings_accepted": 0,
+      "new_findings_rejected": 0,
+      "contested_won": 0,
+      "contested_lost": 0,
+      "accuracy": 0.0,
+      "last_dispatched": null
+    },
+    "architecture": { /* same zeroed fields */ },
+    "correctness": { /* same zeroed fields */ },
+    "performance": { /* same zeroed fields */ }
+  }
+  ```
+- Initialize `classifier` with zeroed routing stats:
+  ```json
+  "classifier": {
+    "total_routes": 0,
+    "overridden_by_user": 0,
+    "fell_back_to_grep": 0,
+    "override_log": []
+  }
+  ```
 - Set `setup_metadata` with detection results
 
 If confidence.json EXISTS:
@@ -238,6 +266,7 @@ If confidence.json EXISTS:
 - Update `review_hooks` if the user changed their Q5 answer
 - Update `token_ceiling` if the user changed their Q6 answer
 - Preserve ALL calibration data (categories, learned_rules, spend, history)
+- If `specialists` key is missing, add the full `specialists` and `classifier` blocks (see above). If they already exist, preserve all existing specialist calibration data.
 
 ### 4g: settings.json
 
