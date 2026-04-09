@@ -54,12 +54,11 @@ The system starts cautious and learns over time. Approve accurate findings, reje
 Every review goes through two isolated agents that never share context:
 
 ```
-Your code → Reviewer (untrusted) → Verifier (adversarial, mandatory) → You
+Your code → Reviewer (discovery) → Verifier (adversarial) → You
 ```
 
-- **Reviewer** reads the diff + language checklists, finds issues. Its output is a hypothesis, not a conclusion.
-- **Verifier** assumes every finding is wrong, independently traces the code to confirm or challenge each one. It also independently audits the diff for issues the reviewer missed.
-- The verifier **always runs** — even when the reviewer finds nothing, even when all categories are auto-approved. No configuration, confidence score, or budget constraint can bypass it.
+- **Reviewer** reads the diff + language checklists, finds issues
+- **Verifier** assumes every finding is wrong, independently traces the code to confirm or challenge each one
 - You only see verified findings with evidence
 
 ### Confidence Calibration
@@ -70,7 +69,7 @@ Each checklist category (e.g., "security in TypeScript") is tracked independentl
 - **Reject** a finding → confidence goes down
 - **Reject with reason** → creates a learned rule the system won't re-flag
 
-When confidence reaches the threshold (~90% accuracy over 15+ reviews), that category is **auto-approved** — the reviewer skips it, saving tokens. The verifier still runs a full independent audit of the diff regardless. Recalibration triggers periodically to verify accuracy hasn't drifted.
+When confidence reaches the threshold (~90% accuracy over 15+ reviews), that category is **auto-approved** — skipped entirely, saving tokens. Recalibration triggers periodically to verify accuracy hasn't drifted.
 
 ### Language Checklists
 

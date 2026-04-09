@@ -1,14 +1,12 @@
 ---
 name: review
-description: Automated code review with two isolated subagents. Computes diff, applies language-specific checklists filtered by confidence calibration, dispatches an isolated reviewer, then ALWAYS dispatches a separate adversarial verifier agent to independently validate findings. Presents only verified findings and collects feedback to train the system.
+description: Automated code review with isolated subagent. Computes diff, applies language-specific checklists filtered by confidence calibration, dispatches an isolated reviewer, presents findings, and collects feedback to train the system.
 user-invocable: true
 ---
 
 # /review — Automated Code Review
 
 You are the review orchestrator. Follow these steps in order. Use the tools available to you (Read, Write, Edit, Bash, Glob, Grep, Agent) to execute each step.
-
-**Architectural invariant — two-agent pipeline:** This system uses two independent agents: a reviewer (finds issues) and a verifier (proves or disproves them). The reviewer is UNTRUSTED — its output is a hypothesis, not a conclusion. The verifier is the quality gate. Confidence calibration controls what the reviewer examines (checklist filtering), but NEVER affects whether the verifier runs. The verifier always runs, always as a separate agent, and always with independent context. No optimization, budget constraint, or confidence score may bypass the verifier.
 
 ## Step 0: Parse Arguments
 
@@ -101,8 +99,6 @@ Read `.claude/review/confidence.json`. Extract:
 - `config.threshold` — the confidence threshold for auto-approval
 - `categories` — the per-category confidence data
 - `learned_rules` — rules with `status: "active"` whose `applies_to` glob matches any changed file
-
-**Scope: confidence calibration governs the reviewer only.** Auto-approval determines which checklist sections the reviewer receives. It does NOT affect the verifier — the verifier always runs a full independent audit of the diff regardless of category confidence scores.
 
 **Calculate effective confidence for each category:**
 
@@ -207,7 +203,7 @@ Log which sections were auto-approved (skipped) — you'll report these to the u
 - Add: "Some categories were skipped because the system has learned they're reliable. Run `/review --calibrate` to see details, or `/review --full` to check everything."
 - Set `first_auto_approve_explained = true`
 
-**All-auto-approved short circuit:** If ALL applicable checklist sections are auto-approved (no sections remain after filtering) and NOT in `--full` mode, skip the reviewer subagent (do not dispatch the reviewer with an empty checklist). However, **still dispatch the verifier agent** (Step 7b) with an empty `{REVIEWER_FINDINGS}` array — the verifier's "all clear / MAXIMUM SUSPICION" protocol will independently review the diff for issues the reviewer would have missed. Report to the user: "All categories auto-approved — reviewer skipped. Verifier performing independent audit. Run `/review --full` to force a complete review." Increment `config.reviews_since_last_full` so recalibration still triggers eventually.
+**All-auto-approved short circuit:** If ALL applicable checklist sections are auto-approved (no sections remain after filtering) and NOT in `--full` mode, skip the reviewer subagent entirely. Report to the user: "All categories auto-approved. No semantic review needed. Run `/review --full` to force a complete review." Increment `config.reviews_since_last_full` so recalibration still triggers eventually. Do not dispatch the reviewer with an empty checklist.
 
 ## Step 5: Mechanical Pre-flight
 
@@ -363,9 +359,8 @@ Choose [1-N]:
 
 ### Mid-Review Controls
 
-**After the reviewer subagent returns (Step 7):**
-
-1. **Reviewer timeout:** If the reviewer takes longer than 120 seconds, stop and report:
+After the reviewer subagent returns (Step 7):
+1. **Timeout:** If the reviewer takes longer than 120 seconds, stop and report:
 ```
 The reviewer took too long (>120s). This usually means the diff is very large.
 
@@ -375,17 +370,9 @@ Try:
   /review --set-ceiling per_review=20000  (if budget allows more)
 ```
 
-2. **Reviewer finding cap:** After parsing the reviewer's JSON, if `findings.length > 25`:
+2. **Finding cap:** After parsing the reviewer's JSON, if `findings.length > 25`:
 - Truncate to top 25 by severity (all Critical, then Important, then Minor)
 - Report: "⚠ Review capped at 25 findings ([total] total). [omitted] Minor findings omitted."
-
-**After the verifier subagent returns (Step 7b):**
-
-3. **Verifier timeout:** If the verifier takes longer than 120 seconds, follow the timeout handling in Step 7b (set `verification_status = "failed"`, report options to user).
-
-4. **Verifier new-finding cap:** After parsing the verifier's JSON, if `new_findings.length > 10`:
-- Truncate to top 10 by severity (all Critical, then Important, then Minor)
-- Report: "⚠ Verifier new findings capped at 10 ([total] total). [omitted] lower-severity findings omitted."
 
 ---
 
@@ -414,64 +401,19 @@ Launch an isolated reviewer subagent using the Agent tool:
 
 Parse the JSON response. If parsing fails (the agent returned prose instead of JSON), ask the agent to retry with JSON-only output.
 
-## Step 7b: Dispatch Verifier Agent (Adversarial Verification) — MANDATORY
+## Step 7b: Dispatch Verifier Agent (Adversarial Verification)
 
-After the reviewer returns findings (or after the reviewer was skipped due to all-auto-approved), dispatch the verifier — a second isolated agent with an adversarial bias. The verifier assumes every finding is wrong until independently proven, and independently audits the diff for issues the reviewer missed.
+After the reviewer returns findings, dispatch the verifier — a second isolated agent with an adversarial bias. The verifier assumes every finding is wrong until independently proven.
 
-**This step is mandatory and cannot be skipped, bypassed, or deferred.** The verifier runs in ALL of these cases:
-- The reviewer found Critical/Important/Minor findings → verifier challenges them
-- The reviewer returned zero findings / a `pass` verdict → verifier independently audits the diff (pass verdicts are the most suspicious — see verifier template)
-- The reviewer returned only Minor findings → verifier still runs (minor issues may mask missed critical ones)
-- The reviewer was skipped due to all-auto-approved (pass an empty findings array — the verifier independently audits the diff)
-- The diff is small or "obviously clean"
-
-No escape hatch, configuration flag, confidence score, or token pressure removes this requirement. If you cannot run the verifier, you cannot present results — see the verification gate in Step 8.
-
-**Must be a separate agent.** The verifier MUST be dispatched as its own Agent tool invocation — a fresh, isolated subagent with no access to the reviewer's context, reasoning, or this conversation's history. This is non-negotiable. The verifier's independence is what makes it valuable; if it shares context with the reviewer or the orchestrating conversation, its "adversarial" role is compromised by the same biases it's meant to catch.
-
-Do NOT:
-- Perform verification inline in this conversation instead of dispatching an agent
-- Reuse or continue the reviewer agent for verification
-- Pass the reviewer's reasoning, thought process, or intermediate analysis to the verifier — only its final JSON output
-- Summarize, filter, or editorialize the reviewer's findings before passing them — pass the raw JSON
-
-Set `verification_status = "pending"` before dispatch.
+**Always runs.** The verifier is not optional. Every finding must survive adversarial scrutiny before the human sees it.
 
 1. Read the verifier template from `.claude/skills/review/verifier-agent.md`
 2. Replace placeholders:
    - `{CHANGE_CONTEXT}` — same Change Context from Step 2
    - `{DIFF}` — same diff from Step 1
-   - `{REVIEWER_FINDINGS}` — the full JSON output from the reviewer (Step 7), including `pass` verdicts with empty findings arrays. If the reviewer was skipped (all-auto-approved), use: `{"findings": [], "summary": {"files_reviewed": 0, "checks_applied": 0, "critical": 0, "important": 0, "minor": 0}, "verdict": "pass", "verdict_reasoning": "Reviewer was skipped (all categories auto-approved). Verifier is performing independent audit."}`
-3. Dispatch via the Agent tool as a NEW, isolated subagent (no access to reviewer's context or this conversation)
+   - `{REVIEWER_FINDINGS}` — the full JSON output from the reviewer (Step 7)
+3. Dispatch as an isolated subagent (no access to reviewer's context or this conversation)
 4. Parse the verifier's JSON response
-
-**Error handling (verifier dispatch):**
-
-- **JSON parse failure:** If the verifier returns prose instead of JSON, retry ONCE with explicit instruction: "Return ONLY the JSON output format specified in your instructions. No prose, no explanation." If the retry also fails, set `verification_status = "failed"` — do NOT proceed to Step 8.
-- **Agent dispatch failure:** If the Agent tool call itself errors (tool execution failure, network error, etc.), retry ONCE. If the retry fails, set `verification_status = "failed"` — do NOT proceed to Step 8.
-- **Timeout:** If the verifier takes longer than 120 seconds, set `verification_status = "failed"` and report:
-```
-The verifier took too long (>120s). This usually means the diff is very large.
-
-Try:
-  /review --staged          (review less code at once)
-  /review --branch          (let the system chunk it into batches)
-```
-- **On any failure**, report to the user:
-```
-⛔ Verification failed — cannot present unverified findings.
-
-The reviewer found [N] findings, but the verifier could not complete.
-Unverified findings are NEVER shown — this is a hard requirement.
-
-Options:
-  1. Retry verification (dispatch verifier again)
-  2. Retry full review (re-run from Step 7)
-  3. Abort this review
-```
-Wait for the user's choice before proceeding.
-
-**On success**, set `verification_status = "complete"`.
 
 **Process the verifier's output:**
 
@@ -491,14 +433,6 @@ For fix test challenges: Store for use in Step 9b (Fix Pipeline) — challenges 
 - If all Criticals were dismissed, verdict may change from `fail` to `pass_with_fixes`
 
 ## Step 8: Present Findings
-
-**Verification gate — HARD REQUIREMENT:**
-Before presenting ANY findings, confirm that `verification_status == "complete"`. If it is not:
-- `"pending"` → Step 7b was skipped. This is a bug in the orchestrator. Do NOT present findings. Go back and execute Step 7b.
-- `"failed"` → The verifier failed and the user was already prompted in Step 7b. Do NOT present findings until the user's chosen recovery path completes.
-- Missing/unset → Step 7b was never attempted. This is a bug. Do NOT present findings. Go back and execute Step 7b.
-
-**You must NEVER present reviewer findings that have not been through adversarial verification.** There are no exceptions to this rule. Unverified findings are untrustworthy and showing them to the user undermines the entire review system's credibility.
 
 Present the VERIFIED findings to the user. Only show findings that survived the verifier (Step 7b). Dismissed findings are excluded.
 
