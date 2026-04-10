@@ -406,7 +406,7 @@ Parse the JSON response. If parsing fails (the agent returned prose instead of J
 
 After the reviewer returns findings, determine which specialist verifier(s) to dispatch.
 
-**If `--full` flag:** Skip classification. Dispatch all 4 specialists (security, architecture, correctness, performance).
+**If `--full` flag:** Use the semantic classifier to select the top 2 most relevant specialists (same rules as normal mode, but always dispatch exactly 2). The `--full` flag affects checklist filtering (Step 4) but does NOT bypass the 2-specialist cap. To dispatch a specific specialist, use `--with`.
 **If `--with specialist1,specialist2` flag:** Skip classification. Dispatch the named specialists.
 **Otherwise:** Run the semantic classifier.
 
@@ -447,7 +447,7 @@ If you cannot determine which specialists to dispatch from the Change Context (e
 | `MySQL.query`, `MySQL.insert`, `SELECT`, `INSERT`, `GetGamePool` | Performance |
 | `while true`, `Wait(0)`, `Wait(1)`, `SetInterval`, `@Scheduled` | Performance |
 
-Score each specialist by signal count. Dispatch top scorer. Dispatch second only if 2+ signals. Tie-break: Security > Correctness > Architecture > Performance.
+Score each specialist by signal count. Dispatch the highest-scoring specialist. Dispatch the second-highest only if it has 2 or more signals of its own. Tie-break: Security > Correctness > Architecture > Performance.
 
 If grep also finds nothing: dispatch Security + Correctness as safe defaults.
 
@@ -469,7 +469,7 @@ For each selected specialist, dispatch an isolated subagent using the Agent tool
    - `{CHANGE_CONTEXT}` — same Change Context from Step 2
    - `{DIFF}` — same diff from Step 1
    - `{REVIEWER_FINDINGS}` — the full JSON output from the reviewer (Step 7)
-   - `{LEARNED_RULES}` — only learned rules where the rule's `specialist` field matches this specialist. If no specialist-specific rules exist, use: "No learned rules apply."
+   - `{LEARNED_RULES}` — learned rules where the rule's `specialist` field matches this specialist OR where `specialist` is null/absent (legacy rules apply to all specialists). If no matching rules exist, use: "No learned rules apply."
 
 4. **Parallel dispatch:** If 2 specialists are selected, launch BOTH Agent tool calls in the same message (parallel execution). Each specialist gets its own isolated subagent with no access to the other specialist's context or this conversation.
 
@@ -490,9 +490,13 @@ When 2 specialists both evaluate the same reviewer finding (matched by `original
 | Confirmed | Confirmed | **Confirmed** (note: both specialists agreed) |
 | Confirmed | Challenged | **Contested** (present both evidence trails) |
 | Confirmed | Dismissed | **Contested** (present both evidence trails) |
+| Confirmed | Unsubstantiated | **Confirmed** (one proved it, other uncertain) |
 | Challenged | Challenged | **Challenged** (present both counter-arguments) |
 | Challenged | Dismissed | **Dismissed** (neither confirmed) |
+| Challenged | Unsubstantiated | **Challenged** (counter-evidence + uncertainty) |
 | Dismissed | Dismissed | **Dismissed** |
+| Dismissed | Unsubstantiated | **Dismissed** (neither confirmed) |
+| Unsubstantiated | Unsubstantiated | **Unsubstantiated** (both uncertain) |
 | Upgraded (either) | Any non-Dismissed | Use higher severity with upgrade evidence |
 | Upgraded (either) | Dismissed | **Contested** (one sees it worse, other sees nothing) |
 
@@ -513,11 +517,11 @@ For findings the reviewer raised but NEITHER specialist addressed: keep the find
 ### Verdict Recalculation
 
 After merge, recalculate the verdict based on the merged finding set:
-- Any Confirmed or Contested Critical → `fail`
-- Any Confirmed or Contested Important → `pass_with_fixes`
+- Any Confirmed, Contested, Unverified, or Unsubstantiated Critical → `fail`
+- Any Confirmed, Contested, Unverified, or Unsubstantiated Important → `pass_with_fixes`
 - Only Minor, Challenged, or all Dismissed → `pass`
 
-Contested findings are treated as their original severity for verdict purposes — they haven't been confirmed safe.
+Unverified, Unsubstantiated, and Contested findings retain their original severity for verdict purposes — they haven't been confirmed safe.
 
 ## Step 8: Present Findings
 
@@ -535,7 +539,7 @@ Present the MERGED findings to the user. Only show findings that survived specia
 Specialists dispatched: [Security Adversary, Correctness Analyst]
 Routing: [Semantic classifier — reasoning summary] | [Grep fallback — signals] | [User override via --with]
 
-Verification summary: [N] confirmed, [N] contested, [N] challenged, [N] dismissed, [N] new from specialists
+Verification summary: [N] confirmed, [N] contested, [N] challenged, [N] unsubstantiated, [N] unverified, [N] upgraded, [N] dismissed, [N] new from specialists
 
 ### Critical
 [numbered findings with file:line, title, explanation, suggestion]
@@ -547,6 +551,7 @@ Each finding includes verification status and specialist attribution:
     Correctness Analyst: confirmed — "[evidence summary]"
     → Your call.
   [CHALLENGED ⚠ Architecture Critic, medium confidence] — specialist found counter-evidence
+  [UNSUBSTANTIATED ~ Security Adversary, low confidence] — specialist could not confirm or deny
   [UNVERIFIED ?] — no specialist evaluated this finding
   [UPGRADED ↑ Performance Sentinel] — specialist found higher severity
   [NEW — from Correctness Analyst] — specialist found this, reviewer missed it
@@ -623,7 +628,8 @@ For each finding:
      "source": "feedback",
      "times_applied": 0,
      "last_applied": null,
-     "status": "active"
+     "status": "active",
+     "specialist": null
    }
    ```
 
@@ -654,16 +660,20 @@ For each finding that has a `specialist_source`:
 
 **If approved:**
 1. Find the specialist in `confidence.json -> specialists -> {name}`
-2. Increment `findings_confirmed_accurate` by 1
-3. If the finding was `source: "new"` (specialist-generated, not reviewer), increment `new_findings_accepted` by 1
-4. If the finding was Contested and this specialist's verdict was the one the human agreed with, increment `contested_won` by 1
+2. **For Contested findings:** Only update the specialist whose verdict aligned with the human's decision:
+   - Winning specialist: increment `findings_confirmed_accurate` and `contested_won`
+   - Losing specialist: increment `findings_rejected` and `contested_lost`
+3. **For non-Contested findings:** Increment `findings_confirmed_accurate` by 1
+4. If the finding was `source: "new"` (specialist-generated, not reviewer), increment `new_findings_accepted` by 1
 5. Recalculate `accuracy = findings_confirmed_accurate / (findings_confirmed_accurate + findings_rejected)`
 
 **If rejected:**
 1. Find the specialist in `confidence.json -> specialists -> {name}`
-2. Increment `findings_rejected` by 1
-3. If the finding was `source: "new"`, increment `new_findings_rejected` by 1
-4. If the finding was Contested and this specialist's verdict was the one the human rejected, increment `contested_lost` by 1
+2. **For Contested findings:** Only update the specialist whose verdict aligned with the human's decision:
+   - Specialist who agreed with rejection: increment `findings_confirmed_accurate` and `contested_won`
+   - Specialist who disagreed: increment `findings_rejected` and `contested_lost`
+3. **For non-Contested findings:** Increment `findings_rejected` by 1
+4. If the finding was `source: "new"`, increment `new_findings_rejected` by 1
 5. Recalculate accuracy
 
 **If rejected with reason:**
